@@ -6,13 +6,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from aiohttp import web
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, text
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.sql import func
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Configuration ---
 raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./test.db")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") 
 PORT = int(os.getenv("PORT", 8080))
@@ -22,6 +22,7 @@ if raw_db_url and raw_db_url.startswith("postgres://"):
 
 Base = declarative_base()
 
+# --- Database Models ---
 class Trade(Base):
     __tablename__ = 'trades'
     id = Column(Integer, primary_key=True)
@@ -53,6 +54,7 @@ class Portfolio(Base):
     btc_balance = Column(Float, default=0.0)
     last_updated = Column(DateTime, default=datetime.utcnow)
 
+# --- Engine Setup ---
 try:
     engine = create_engine(raw_db_url, echo=False)
     SessionLocal = sessionmaker(bind=engine)
@@ -66,33 +68,47 @@ def get_db_session():
         return SessionLocal()
     return None
 
+# --- Self-Healing Database Initialization ---
 def init_db():
-    if engine:
-        try:
-            Base.metadata.create_all(engine)
-            session = SessionLocal()
-            portfolio = session.query(Portfolio).first()
-            if not portfolio:
-                initial_portfolio = Portfolio(usd_balance=10000.0, btc_balance=0.0)
-                session.add(initial_portfolio)
-                session.commit()
-                print("✅ Portfolio Initialized with $10,000")
-            session.close()
-            print("✅ Tables Verified")
-        except Exception as e:
-            print(f"❌ Error creating tables: {e}")
+    if not engine:
+        return
 
+    # 1. Check if tables are outdated
+    try:
+        with engine.connect() as conn:
+            # Try to select a new column. If it fails, the DB is old.
+            conn.execute(text("SELECT quantity FROM trades LIMIT 1"))
+    except Exception:
+        print("⚠️ Outdated Database Schema detected. Resetting tables...")
+        Base.metadata.drop_all(engine)
+    
+    # 2. Create Tables
+    try:
+        Base.metadata.create_all(engine)
+        
+        # 3. Initialize Portfolio if empty
+        session = SessionLocal()
+        portfolio = session.query(Portfolio).first()
+        if not portfolio:
+            initial_portfolio = Portfolio(usd_balance=10000.0, btc_balance=0.0)
+            session.add(initial_portfolio)
+            session.commit()
+            print("✅ Portfolio Initialized with $10,000")
+        session.close()
+        print("✅ Database Tables Verified & Ready")
+    except Exception as e:
+        print(f"❌ Error creating tables: {e}")
+
+# --- Helper Functions ---
 def send_discord_alert(message):
     if DISCORD_WEBHOOK:
-        data = {"content": message, "username": "Quant Bot Pro"}
         try:
-            requests.post(DISCORD_WEBHOOK, json=data)
-        except Exception:
+            requests.post(DISCORD_WEBHOOK, json={"content": message, "username": "Quant Bot Pro"})
+        except:
             pass
 
 def calculate_rsi(prices, period=14):
-    if len(prices) < period:
-        return 50.0
+    if len(prices) < period: return 50.0
     deltas = np.diff(prices)
     seed = deltas[:period+1]
     up = seed[seed >= 0].sum()/period
@@ -110,16 +126,13 @@ def calculate_rsi(prices, period=14):
         else:
             upval = 0.
             downval = -delta
-        
         up = (up*(period-1) + upval)/period
         down = (down*(period-1) + downval)/period
-        if down == 0:
-            rs = 0
-        else:
-            rs = up/down
+        rs = up/down if down != 0 else 0
         rsi[i] = 100. - 100./(1. + rs)
     return float(rsi[-1])
 
+# --- Trading Logic ---
 async def trading_loop():
     print("🚀 Advanced Trading Logic Started...")
     current_price = 45000.0
@@ -131,28 +144,24 @@ async def trading_loop():
             continue
 
         try:
+            # Market Move
             change = random.uniform(-150, 155) 
             current_price += change
             
-            price_entry = PriceLog(price=current_price)
-            session.add(price_entry)
+            # Log Price
+            session.add(PriceLog(price=current_price))
             session.commit()
 
+            # Technical Analysis
             history = session.query(PriceLog.price).order_by(PriceLog.id.desc()).limit(30).all()
             price_list = [p[0] for p in history][::-1]
 
-            rsi_value = 50.0
-            sma_value = 0.0
-
-            if len(price_list) >= 14:
-                rsi_value = calculate_rsi(price_list)
+            rsi_value = calculate_rsi(price_list) if len(price_list) >= 14 else 50.0
+            sma_value = sum(price_list[-20:]) / 20 if len(price_list) >= 20 else 0.0
             
-            if len(price_list) >= 20:
-                sma_value = sum(price_list[-20:]) / 20
-            
-            ind_log = IndicatorLog(rsi=float(rsi_value), sma_20=float(sma_value))
-            session.add(ind_log)
+            session.add(IndicatorLog(rsi=float(rsi_value), sma_20=float(sma_value)))
 
+            # Strategy
             portfolio = session.query(Portfolio).first()
             trade_side = None
             quantity = 0.0
@@ -171,20 +180,12 @@ async def trading_loop():
 
             if trade_side:
                 trade = Trade(
-                    symbol="BTC/USD", 
-                    side=trade_side, 
-                    price=current_price, 
-                    quantity=quantity,
-                    usd_balance=portfolio.usd_balance,
+                    symbol="BTC/USD", side=trade_side, price=current_price, 
+                    quantity=quantity, usd_balance=portfolio.usd_balance, 
                     btc_balance=portfolio.btc_balance
                 )
                 session.add(trade)
-                
-                total_val = portfolio.usd_balance + (portfolio.btc_balance * current_price)
-                msg = (f"🚨 **{trade_side} EXECUTION** 🚨\n"
-                       f"Price: ${current_price:,.2f}\n"
-                       f"RSI: {rsi_value:.2f}\n"
-                       f"Portfolio Value: ${total_val:,.2f}")
+                msg = f"🚨 **{trade_side}** | Price: ${current_price:,.2f} | RSI: {rsi_value:.1f}"
                 print(msg)
                 send_discord_alert(msg)
             
@@ -198,8 +199,9 @@ async def trading_loop():
         
         await asyncio.sleep(5)
 
+# --- Web Server ---
 async def health_check(request):
-    return web.Response(text="Advanced Bot Running")
+    return web.Response(text="Bot Running")
 
 async def start_background_tasks(app):
     app['bot_task'] = asyncio.create_task(trading_loop())
