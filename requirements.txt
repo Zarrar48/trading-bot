@@ -1,0 +1,9 @@
+asyncio
+psycopg2-binary
+pandas
+sqlalchemy
+streamlit
+requests
+python-dotenv
+plotly
+aiohttp
