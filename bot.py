@@ -10,12 +10,26 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 # --- Configuration ---
 # We use External URL for local test, Internal for Render
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/tradingbot")
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./test.db")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") 
 PORT = int(os.getenv("PORT", 8080)) # Render provides a port automatically
-
+if raw_db_url and raw_db_url.startswith("postgres://"):
+    raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
 # --- Database Setup ---
 Base = declarative_base()
+try:
+    engine = create_engine(raw_db_url, echo=False)
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    print("✅ Database Connected Successfully")
+except Exception as e:
+    print(f"❌ Database Connection Failed: {e}")
+    engine = None
+
+def get_db_session():
+    if engine:
+        return SessionLocal()
+    return None
 
 class Trade(Base):
     __tablename__ = 'trades'

@@ -5,12 +5,16 @@ import os
 import time
 import plotly.express as px
 
-# Config
-st.set_page_config(page_title="Crypto Bot Dashboard", layout="wide")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@db:5432/tradingbot")
+raw_db_url = os.getenv("DATABASE_URL")
 
-# DB Connection
-engine = create_engine(DATABASE_URL)
+if raw_db_url and raw_db_url.startswith("postgres://"):
+    raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
+
+if not raw_db_url:
+    st.error("DATABASE_URL is missing! Check your .env or Render settings.")
+    st.stop()
+
+engine = create_engine(raw_db_url)
 
 st.title("⚡ Automated Crypto Trading Bot")
 st.markdown("### Live Performance Monitor")
