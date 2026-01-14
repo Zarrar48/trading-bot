@@ -7,6 +7,8 @@ from datetime import datetime
 from aiohttp import web
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- Configuration ---
 # We use External URL for local test, Internal for Render
@@ -45,15 +47,6 @@ class PriceLog(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
     price = Column(Float)
 
-def get_db_session():
-    try:
-        engine = create_engine(DATABASE_URL)
-        Base.metadata.create_all(engine)
-        Session = sessionmaker(bind=engine)
-        return Session()
-    except Exception as e:
-        print(f"DB Connection Error: {e}")
-        return None
 
 # --- Discord Notification ---
 def send_discord_alert(message):
