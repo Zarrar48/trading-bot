@@ -5,9 +5,10 @@ import logging
 import pandas as pd
 import pandas_ta as ta
 import websockets
+import numpy as np
 from datetime import datetime, timezone
 from aiohttp import web, ClientSession
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, text, inspect
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
@@ -67,29 +68,7 @@ SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
     if not engine: return
-    
-    needs_reset = False
-    try:
-        inspector = inspect(engine)
-        
-        if inspector.has_table("indicators"):
-            columns = [col['name'] for col in inspector.get_columns("indicators")]
-            if "ema_200" not in columns:
-                needs_reset = True
-        
-        if inspector.has_table("trades"):
-            columns = [col['name'] for col in inspector.get_columns("trades")]
-            if "quantity" not in columns:
-                needs_reset = True
-                
-    except Exception:
-        needs_reset = True
-
-    if needs_reset:
-        Base.metadata.drop_all(engine)
-    
     Base.metadata.create_all(engine)
-    
     session = SessionLocal()
     if not session.query(Portfolio).first():
         session.add(Portfolio(usd_balance=10000.0, btc_balance=0.0))
@@ -117,76 +96,106 @@ class StrategyEngine:
         self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True).tail(300)
 
     def analyze(self):
-        if len(self.df) < 200: return None
+        if self.df.empty: return None
+
+        # Check data sufficiency
+        has_enough_data = len(self.df) >= 200
         
-        self.df.ta.rsi(length=14, append=True)
-        self.df.ta.sma(length=20, append=True)
-        self.df.ta.ema(length=200, append=True)
-        self.df.ta.macd(append=True)
+        # Calculate Indicators (Safe Mode)
+        if len(self.df) >= 14: self.df.ta.rsi(length=14, append=True)
+        if len(self.df) >= 20: self.df.ta.sma(length=20, append=True)
+        if len(self.df) >= 200: self.df.ta.ema(length=200, append=True)
+        if len(self.df) >= 35: self.df.ta.macd(append=True)
 
         curr = self.df.iloc[-1]
-        prev = self.df.iloc[-2]
+        prev = self.df.iloc[-2] if len(self.df) > 1 else curr
         
+        # --- CRITICAL FIX: Convert NumPy types to Python floats ---
+        def safe_float(val):
+            if hasattr(val, "item"): 
+                return float(val.item())  # Handle numpy types
+            try:
+                return float(val)
+            except:
+                return 0.0
+
         return {
-            'price': curr['close'],
-            'rsi': curr['RSI_14'],
-            'sma_20': curr['SMA_20'],
-            'ema_200': curr['EMA_200'],
-            'macd_h': curr['MACDh_12_26_9'],
-            'macd_h_prev': prev['MACDh_12_26_9']
+            'ready': has_enough_data,
+            'price': safe_float(curr['close']),
+            'rsi': safe_float(curr.get('RSI_14', 50)),
+            'sma_20': safe_float(curr.get('SMA_20', 0)),
+            'ema_200': safe_float(curr.get('EMA_200', 0)),
+            'macd_h': safe_float(curr.get('MACDh_12_26_9', 0)),
+            'macd_h_prev': safe_float(prev.get('MACDh_12_26_9', 0))
         }
 
-async def execute_trade_logic(signals, http_session):
+async def process_market_update(signals, http_session):
     with SessionLocal() as session:
+        # 1. Log Price (Converted to native float)
+        session.add(PriceLog(price=signals['price']))
+        session.add(IndicatorLog(
+            rsi=signals['rsi'], 
+            sma_20=signals['sma_20'], 
+            ema_200=signals['ema_200']
+        ))
+        
         portfolio = session.query(Portfolio).first()
+        
+        # 2. Warmup Check
+        if not signals['ready']:
+            logger.info(f"❄️ Warming up... Data points: {len(signals.get('ema_200_hist', [])) if isinstance(signals.get('ema_200_hist'), list) else 'Collecting...'}")
+            session.commit()
+            return
+
+        # 3. Trade Logic
         price = signals['price']
-        
-        session.add(PriceLog(price=price))
-        session.add(IndicatorLog(rsi=signals['rsi'], sma_20=signals['sma_20'], ema_200=signals['ema_200']))
-        
         trade_side = None
         reason = ""
-
+        
+        # Simple trend check
         is_uptrend = price > signals['ema_200']
         
         if not portfolio.in_position:
+            # Buy Condition
             if is_uptrend and signals['rsi'] < 40 and signals['macd_h'] > signals['macd_h_prev']:
                 trade_side = "BUY"
                 reason = "Uptrend RSI Pullback"
-                qty = (portfolio.usd_balance * 0.98) / price
-                portfolio.btc_balance = qty
-                portfolio.usd_balance -= (qty * price)
+                qty = (portfolio.usd_balance * 0.99) / price
+                portfolio.btc_balance = float(qty)
+                portfolio.usd_balance -= float(qty * price)
                 portfolio.in_position = True
                 portfolio.entry_price = price
                 portfolio.highest_price = price
 
         elif portfolio.in_position:
+            # Manage Position
             if price > portfolio.highest_price:
                 portfolio.highest_price = price
             
             pnl = (price - portfolio.entry_price) / portfolio.entry_price
-            drawdown_from_peak = (portfolio.highest_price - price) / portfolio.highest_price
+            drawdown = (portfolio.highest_price - price) / portfolio.highest_price
             
+            # Sell Conditions
             if signals['rsi'] > 70:
                 trade_side = "SELL"
                 reason = "RSI Overbought"
-            elif drawdown_from_peak > 0.015:
+            elif drawdown > 0.015:
                 trade_side = "SELL"
-                reason = "Trailing Stop Triggered"
+                reason = "Trailing Stop (1.5%)"
             elif pnl < -0.02:
                 trade_side = "SELL"
-                reason = "Hard Stop Loss"
+                reason = "Stop Loss (-2%)"
 
             if trade_side == "SELL":
-                portfolio.usd_balance += (portfolio.btc_balance * price)
-                portfolio.btc_balance = 0
+                portfolio.usd_balance += float(portfolio.btc_balance * price)
+                portfolio.btc_balance = 0.0
                 portfolio.in_position = False
 
         if trade_side:
             new_trade = Trade(
                 symbol="BTC/USD", side=trade_side, price=price, 
                 quantity=portfolio.btc_balance if trade_side=="BUY" else 0,
-                usd_balance=portfolio.usd_balance, btc_balance=portfolio.btc_balance,
+                usd_balance=float(portfolio.usd_balance), btc_balance=float(portfolio.btc_balance),
                 reason=reason
             )
             session.add(new_trade)
@@ -199,32 +208,33 @@ async def execute_trade_logic(signals, http_session):
 
 async def market_data_loop(http_session):
     strategy = StrategyEngine()
-    logger.info(f"🚀 Real-Time Trading Engine Started on {BINANCE_WS_URL}")
+    logger.info(f"🚀 Real-Time Trading Engine Started")
     
     while True:
         try:
             async for websocket in websockets.connect(BINANCE_WS_URL):
                 try:
                     while True:
-                        message = await websocket.recv()
-                        data = json.loads(message)
+                        msg = await websocket.recv()
+                        data = json.loads(msg)
                         candle = data['k']
                         
-                        if candle['x']:
+                        if candle['x']: # Candle closed
                             strategy.update(candle)
                             signals = strategy.analyze()
                             if signals:
-                                await execute_trade_logic(signals, http_session)
+                                await process_market_update(signals, http_session)
+                                logger.info(f"Tick: ${signals['price']:,.2f} | RSI: {signals['rsi']:.1f}")
                         
                 except websockets.ConnectionClosed:
-                    logger.warning("WebSocket Connection Closed. Reconnecting...")
+                    logger.warning("Reconnecting...")
                     break
         except Exception as e:
-            logger.error(f"Loop Error: {e}")
+            logger.error(f"Error: {e}")
             await asyncio.sleep(5)
 
 async def health_check(request):
-    return web.Response(text="Bot Running - Real Time Engine Active")
+    return web.Response(text="Bot Active")
 
 async def start_background_tasks(app):
     app['http_session'] = ClientSession()
