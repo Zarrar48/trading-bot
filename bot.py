@@ -2,30 +2,25 @@ import asyncio
 import json
 import os
 import logging
-import random
 import pandas as pd
 import pandas_ta as ta
 import websockets
-import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from aiohttp import web, ClientSession
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, text, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./trading_bot_pro.db")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_1m"
 PORT = int(os.getenv("PORT", 8080))
 
-# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger("QuantBotPro")
 
-# --- Database Models (Retaining all original tables) ---
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -34,7 +29,7 @@ Base = declarative_base()
 class Trade(Base):
     __tablename__ = 'trades'
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     symbol = Column(String, default="BTC/USD")
     side = Column(String)
     price = Column(Float)
@@ -46,13 +41,13 @@ class Trade(Base):
 class PriceLog(Base):
     __tablename__ = 'prices'
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     price = Column(Float)
 
 class IndicatorLog(Base):
     __tablename__ = 'indicators'
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     rsi = Column(Float)
     sma_20 = Column(Float)
     ema_200 = Column(Float)
@@ -65,20 +60,32 @@ class Portfolio(Base):
     in_position = Column(Boolean, default=False)
     entry_price = Column(Float, default=0.0)
     highest_price = Column(Float, default=0.0)
-    last_updated = Column(DateTime, default=datetime.utcnow)
+    last_updated = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# --- Engine & Initialization (Self-Healing Logic) ---
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
     if not engine: return
+    
+    needs_reset = False
     try:
-        with engine.connect() as conn:
-            # Original check: if quantity column exists
-            conn.execute(text("SELECT quantity FROM trades LIMIT 1"))
+        inspector = inspect(engine)
+        
+        if inspector.has_table("indicators"):
+            columns = [col['name'] for col in inspector.get_columns("indicators")]
+            if "ema_200" not in columns:
+                needs_reset = True
+        
+        if inspector.has_table("trades"):
+            columns = [col['name'] for col in inspector.get_columns("trades")]
+            if "quantity" not in columns:
+                needs_reset = True
+                
     except Exception:
-        logger.warning("⚠️ Outdated Schema. Resetting tables...")
+        needs_reset = True
+
+    if needs_reset:
         Base.metadata.drop_all(engine)
     
     Base.metadata.create_all(engine)
@@ -87,11 +94,8 @@ def init_db():
     if not session.query(Portfolio).first():
         session.add(Portfolio(usd_balance=10000.0, btc_balance=0.0))
         session.commit()
-        logger.info("✅ Portfolio Initialized with $10,000")
     session.close()
-    logger.info("✅ Database Tables Verified & Ready")
 
-# --- Helper Functions ---
 async def send_discord_alert(http_session, message):
     if DISCORD_WEBHOOK:
         try:
@@ -99,7 +103,6 @@ async def send_discord_alert(http_session, message):
         except Exception as e:
             logger.error(f"Discord Error: {e}")
 
-# --- Strategy Engine (Detailed Analysis) ---
 class StrategyEngine:
     def __init__(self):
         self.df = pd.DataFrame()
@@ -116,7 +119,6 @@ class StrategyEngine:
     def analyze(self):
         if len(self.df) < 200: return None
         
-        # Technical Analysis using pandas_ta
         self.df.ta.rsi(length=14, append=True)
         self.df.ta.sma(length=20, append=True)
         self.df.ta.ema(length=200, append=True)
@@ -134,23 +136,19 @@ class StrategyEngine:
             'macd_h_prev': prev['MACDh_12_26_9']
         }
 
-# --- Core Trading Logic ---
 async def execute_trade_logic(signals, http_session):
     with SessionLocal() as session:
         portfolio = session.query(Portfolio).first()
         price = signals['price']
         
-        # 1. Log Price and Indicators (Retaining original logging requirement)
         session.add(PriceLog(price=price))
         session.add(IndicatorLog(rsi=signals['rsi'], sma_20=signals['sma_20'], ema_200=signals['ema_200']))
         
         trade_side = None
         reason = ""
 
-        # 2. Strategy: Trend Following + RSI Pullback
         is_uptrend = price > signals['ema_200']
         
-        # BUY Condition
         if not portfolio.in_position:
             if is_uptrend and signals['rsi'] < 40 and signals['macd_h'] > signals['macd_h_prev']:
                 trade_side = "BUY"
@@ -162,7 +160,6 @@ async def execute_trade_logic(signals, http_session):
                 portfolio.entry_price = price
                 portfolio.highest_price = price
 
-        # SELL Condition (Take Profit / Trailing Stop)
         elif portfolio.in_position:
             if price > portfolio.highest_price:
                 portfolio.highest_price = price
@@ -173,10 +170,10 @@ async def execute_trade_logic(signals, http_session):
             if signals['rsi'] > 70:
                 trade_side = "SELL"
                 reason = "RSI Overbought"
-            elif drawdown_from_peak > 0.015: # 1.5% Trailing Stop
+            elif drawdown_from_peak > 0.015:
                 trade_side = "SELL"
                 reason = "Trailing Stop Triggered"
-            elif pnl < -0.02: # 2% Hard Stop
+            elif pnl < -0.02:
                 trade_side = "SELL"
                 reason = "Hard Stop Loss"
 
@@ -185,7 +182,6 @@ async def execute_trade_logic(signals, http_session):
                 portfolio.btc_balance = 0
                 portfolio.in_position = False
 
-        # 3. Handle Trade Execution & Logging
         if trade_side:
             new_trade = Trade(
                 symbol="BTC/USD", side=trade_side, price=price, 
@@ -198,32 +194,35 @@ async def execute_trade_logic(signals, http_session):
             logger.info(msg)
             await send_discord_alert(http_session, msg)
         
-        portfolio.last_updated = datetime.utcnow()
+        portfolio.last_updated = datetime.now(timezone.utc)
         session.commit()
 
 async def market_data_loop(http_session):
     strategy = StrategyEngine()
     logger.info(f"🚀 Real-Time Trading Engine Started on {BINANCE_WS_URL}")
     
-    async for websocket in websockets.connect(BINANCE_WS_URL):
+    while True:
         try:
-            while True:
-                message = await websocket.recv()
-                data = json.loads(message)
-                candle = data['k']
-                
-                # Check for candle close to calculate signals
-                if candle['x']:
-                    strategy.update(candle)
-                    signals = strategy.analyze()
-                    if signals:
-                        await execute_trade_logic(signals, http_session)
-                
+            async for websocket in websockets.connect(BINANCE_WS_URL):
+                try:
+                    while True:
+                        message = await websocket.recv()
+                        data = json.loads(message)
+                        candle = data['k']
+                        
+                        if candle['x']:
+                            strategy.update(candle)
+                            signals = strategy.analyze()
+                            if signals:
+                                await execute_trade_logic(signals, http_session)
+                        
+                except websockets.ConnectionClosed:
+                    logger.warning("WebSocket Connection Closed. Reconnecting...")
+                    break
         except Exception as e:
             logger.error(f"Loop Error: {e}")
             await asyncio.sleep(5)
 
-# --- Web Server ---
 async def health_check(request):
     return web.Response(text="Bot Running - Real Time Engine Active")
 
