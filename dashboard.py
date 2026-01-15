@@ -179,7 +179,7 @@ while True:
                 values = [usd, btc * cur_p]
                 pie = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.6, marker_colors=['#1E222D', '#2962FF'])])
                 pie.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0), height=250, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True, key=f"main_chart_{time.time()}")
+                st.plotly_chart(pie, use_container_width=True, key=f"pie_chart_{time.time()}")
 
         time.sleep(refresh_rate)
 
